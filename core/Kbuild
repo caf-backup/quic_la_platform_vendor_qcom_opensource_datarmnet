@@ -1,3 +1,7 @@
+ifneq (, $(filter y, $(CONFIG_ARCH_LAHAINA) $(CONFIG_ARCH_WAIPIO)))
+ccflags-y	+= -DRMNET_LA_PLATFORM
+endif
+
 ifeq ($(CONFIG_ARCH_SDXNIGHTJAR), y)
 ccflags-y	+= -DRMNET_TRACE_INCLUDE_LE
 endif
