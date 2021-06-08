@@ -23,6 +23,7 @@
 #include "rmnet_private.h"
 #include "rmnet_map.h"
 #include "rmnet_descriptor.h"
+#include "rmnet_ll.h"
 #include "rmnet_genl.h"
 #include "rmnet_qmi.h"
 #include "qmi_rmnet.h"
@@ -57,6 +58,7 @@
 enum {
 	IFLA_RMNET_DFC_QOS = __IFLA_RMNET_MAX,
 	IFLA_RMNET_UL_AGG_PARAMS,
+	IFLA_RMNET_UL_AGG_STATE_ID,
 	__IFLA_RMNET_EXT_MAX,
 };
 
@@ -72,6 +74,9 @@ static const struct nla_policy rmnet_policy[__IFLA_RMNET_EXT_MAX] = {
 	},
 	[IFLA_RMNET_UL_AGG_PARAMS] = {
 		.len = sizeof(struct rmnet_egress_agg_params)
+	},
+	[IFLA_RMNET_UL_AGG_STATE_ID] = {
+		.type = NLA_U8
 	},
 };
 
@@ -226,14 +231,18 @@ static int rmnet_newlink(struct net *src_net, struct net_device *dev,
 	}
 
 	if (data[IFLA_RMNET_UL_AGG_PARAMS]) {
-		void *agg_params;
-		unsigned long irq_flags;
+		struct rmnet_egress_agg_params *agg_params;
+		u8 state = RMNET_DEFAULT_AGG_STATE;
 
 		agg_params = nla_data(data[IFLA_RMNET_UL_AGG_PARAMS]);
-		spin_lock_irqsave(&port->agg_lock, irq_flags);
-		memcpy(&port->egress_agg_params, agg_params,
-		       sizeof(port->egress_agg_params));
-		spin_unlock_irqrestore(&port->agg_lock, irq_flags);
+		if (data[IFLA_RMNET_UL_AGG_STATE_ID])
+			state = nla_get_u8(data[IFLA_RMNET_UL_AGG_STATE_ID]);
+
+		rmnet_map_update_ul_agg_config(&port->agg_state[state],
+					       agg_params->agg_size,
+					       agg_params->agg_count,
+					       agg_params->agg_features,
+					       agg_params->agg_time);
 	}
 
 	return 0;
@@ -359,19 +368,25 @@ static int rmnet_rtnl_validate(struct nlattr *tb[], struct nlattr *data[],
 	struct rmnet_egress_agg_params *agg_params;
 	u16 mux_id;
 
-	if (!data) {
+	if (!data)
 		return -EINVAL;
-	} else {
-		if (data[IFLA_RMNET_MUX_ID]) {
-			mux_id = nla_get_u16(data[IFLA_RMNET_MUX_ID]);
-			if (mux_id > (RMNET_MAX_LOGICAL_EP - 1))
-				return -ERANGE;
-		}
 
-		if (data[IFLA_RMNET_UL_AGG_PARAMS]) {
-			agg_params = nla_data(data[IFLA_RMNET_UL_AGG_PARAMS]);
-			if (agg_params->agg_time < 1000000)
-				return -EINVAL;
+	if (data[IFLA_RMNET_MUX_ID]) {
+		mux_id = nla_get_u16(data[IFLA_RMNET_MUX_ID]);
+		if (mux_id > (RMNET_MAX_LOGICAL_EP - 1))
+			return -ERANGE;
+	}
+
+	if (data[IFLA_RMNET_UL_AGG_PARAMS]) {
+		agg_params = nla_data(data[IFLA_RMNET_UL_AGG_PARAMS]);
+		if (agg_params->agg_time < 1000000)
+			return -EINVAL;
+
+		if (data[IFLA_RMNET_UL_AGG_STATE_ID]) {
+			u8 state = nla_get_u8(data[IFLA_RMNET_UL_AGG_STATE_ID]);
+
+			if (state >= RMNET_MAX_AGG_STATE)
+				return -ERANGE;
 		}
 	}
 
@@ -387,6 +402,7 @@ static int rmnet_changelink(struct net_device *dev, struct nlattr *tb[],
 	struct rmnet_endpoint *ep;
 	struct rmnet_port *port;
 	u16 mux_id;
+	int rc = 0;
 
 	real_dev = __dev_get_by_index(dev_net(dev),
 				      nla_get_u32(tb[IFLA_LINK]));
@@ -417,23 +433,29 @@ static int rmnet_changelink(struct net_device *dev, struct nlattr *tb[],
 	}
 
 	if (data[IFLA_RMNET_DFC_QOS]) {
+		struct nlattr *qos = data[IFLA_RMNET_DFC_QOS];
 		struct tcmsg *tcm;
 
-		tcm = nla_data(data[IFLA_RMNET_DFC_QOS]);
-		qmi_rmnet_change_link(dev, port, tcm);
+		tcm = nla_data(qos);
+		rc = qmi_rmnet_change_link(dev, port, tcm, nla_len(qos));
 	}
 
 	if (data[IFLA_RMNET_UL_AGG_PARAMS]) {
 		struct rmnet_egress_agg_params *agg_params;
+		u8 state = RMNET_DEFAULT_AGG_STATE;
 
 		agg_params = nla_data(data[IFLA_RMNET_UL_AGG_PARAMS]);
-		rmnet_map_update_ul_agg_config(port, agg_params->agg_size,
+		if (data[IFLA_RMNET_UL_AGG_STATE_ID])
+			state = nla_get_u8(data[IFLA_RMNET_UL_AGG_STATE_ID]);
+
+		rmnet_map_update_ul_agg_config(&port->agg_state[state],
+					       agg_params->agg_size,
 					       agg_params->agg_count,
 					       agg_params->agg_features,
 					       agg_params->agg_time);
 	}
 
-	return 0;
+	return rc;
 }
 
 static size_t rmnet_get_size(const struct net_device *dev)
@@ -474,9 +496,16 @@ static int rmnet_fill_info(struct sk_buff *skb, const struct net_device *dev)
 		goto nla_put_failure;
 
 	if (port) {
+		struct rmnet_aggregation_state *state;
+
+		/* Only report default for now. The entire message type
+		 * would need to change to get both states in there (nested
+		 * messages, etc), since they both have the same NLA type...
+		 */
+		state = &port->agg_state[RMNET_DEFAULT_AGG_STATE];
 		if (nla_put(skb, IFLA_RMNET_UL_AGG_PARAMS,
-			    sizeof(port->egress_agg_params),
-			    &port->egress_agg_params))
+			    sizeof(state->params),
+			    &state->params))
 			goto nla_put_failure;
 	}
 
@@ -770,6 +799,13 @@ static int __init rmnet_init(void)
 		return rc;
 	}
 
+	rc = rmnet_ll_init();
+	if (rc != 0) {
+		unregister_netdevice_notifier(&rmnet_dev_notifier);
+		rtnl_link_unregister(&rmnet_link_ops);
+		return rc;
+	}
+
 	rmnet_core_genl_init();
 
 	try_module_get(THIS_MODULE);
@@ -780,6 +816,7 @@ static void __exit rmnet_exit(void)
 {
 	unregister_netdevice_notifier(&rmnet_dev_notifier);
 	rtnl_link_unregister(&rmnet_link_ops);
+	rmnet_ll_exit();
 	rmnet_core_genl_deinit();
 
 	module_put(THIS_MODULE);

@@ -37,6 +37,10 @@ typedef void (*rmnet_perf_desc_hook_t)(struct rmnet_frag_descriptor *frag_desc,
 				       struct rmnet_port *port);
 typedef void (*rmnet_perf_chain_hook_t)(void);
 
+typedef void (*rmnet_perf_tether_ingress_hook_t)(struct tcphdr *tp, struct sk_buff *skb);
+rmnet_perf_tether_ingress_hook_t rmnet_perf_tether_ingress_hook __rcu __read_mostly;
+EXPORT_SYMBOL(rmnet_perf_tether_ingress_hook);
+
 struct rmnet_frag_descriptor *
 rmnet_get_frag_descriptor(struct rmnet_port *port)
 {
@@ -541,6 +545,12 @@ int rmnet_frag_flow_command(struct rmnet_frag_descriptor *frag_desc,
 	if (!cmd)
 		return -1;
 
+	/* Silently discard any marksers recived over the LL channel */
+	if (frag_desc->priority == 0xda1a &&
+	    (cmd->command_name == RMNET_MAP_COMMAND_FLOW_START ||
+	     cmd->command_name == RMNET_MAP_COMMAND_FLOW_END))
+		return 0;
+
 	switch (cmd->command_name) {
 	case RMNET_MAP_COMMAND_FLOW_START:
 		rmnet_frag_process_flow_start(frag_desc, cmd, port, pkt_len);
@@ -561,7 +571,7 @@ EXPORT_SYMBOL(rmnet_frag_flow_command);
 static int rmnet_frag_deaggregate_one(struct sk_buff *skb,
 				      struct rmnet_port *port,
 				      struct list_head *list,
-				      u32 start)
+				      u32 start, u32 priority)
 {
 	struct skb_shared_info *shinfo = skb_shinfo(skb);
 	struct rmnet_frag_descriptor *frag_desc;
@@ -615,6 +625,7 @@ static int rmnet_frag_deaggregate_one(struct sk_buff *skb,
 	if (!frag_desc)
 		return -1;
 
+	frag_desc->priority = priority;
 	pkt_len += sizeof(*maph);
 	if (port->data_format & RMNET_FLAGS_INGRESS_MAP_CKSUMV4) {
 		pkt_len += sizeof(struct rmnet_map_dl_csum_trailer);
@@ -693,13 +704,14 @@ static int rmnet_frag_deaggregate_one(struct sk_buff *skb,
 }
 
 void rmnet_frag_deaggregate(struct sk_buff *skb, struct rmnet_port *port,
-			    struct list_head *list)
+			    struct list_head *list, u32 priority)
 {
 	u32 start = 0;
 	int rc;
 
 	while (start < skb->len) {
-		rc = rmnet_frag_deaggregate_one(skb, port, list, start);
+		rc = rmnet_frag_deaggregate_one(skb, port, list, start,
+						priority);
 		if (rc < 0)
 			return;
 
@@ -731,6 +743,7 @@ static void rmnet_frag_gso_stamp(struct sk_buff *skb,
 static void rmnet_frag_partial_csum(struct sk_buff *skb,
 				    struct rmnet_frag_descriptor *frag_desc)
 {
+	rmnet_perf_tether_ingress_hook_t rmnet_perf_tether_ingress;
 	struct iphdr *iph = (struct iphdr *)skb->data;
 	__sum16 pseudo;
 	u16 pkt_len = skb->len - frag_desc->ip_len;
@@ -757,6 +770,10 @@ static void rmnet_frag_partial_csum(struct sk_buff *skb,
 
 		tp->check = pseudo;
 		skb->csum_offset = offsetof(struct tcphdr, check);
+
+		rmnet_perf_tether_ingress = rcu_dereference(rmnet_perf_tether_ingress_hook);
+		if (rmnet_perf_tether_ingress)
+			rmnet_perf_tether_ingress(tp, skb);
 	} else {
 		struct udphdr *up = (struct udphdr *)
 				    ((u8 *)iph + frag_desc->ip_len);
@@ -958,6 +975,8 @@ skip_frags:
 	if (frag_desc->gso_segs > 1)
 		rmnet_frag_gso_stamp(head_skb, frag_desc);
 
+	/* Propagate original priority value */
+	head_skb->priority = frag_desc->priority;
 	return head_skb;
 }
 
@@ -1509,6 +1528,7 @@ __rmnet_frag_ingress_handler(struct rmnet_frag_descriptor *frag_desc,
 	LIST_HEAD(segs);
 	u16 len, pad;
 	u8 mux_id;
+	bool skip_perf = (frag_desc->priority == 0xda1a);
 
 	qmap = rmnet_frag_header_ptr(frag_desc, 0, sizeof(*qmap), &__qmap);
 	if (!qmap)
@@ -1561,6 +1581,9 @@ __rmnet_frag_ingress_handler(struct rmnet_frag_descriptor *frag_desc,
 	if (port->data_format & RMNET_INGRESS_FORMAT_PS)
 		qmi_rmnet_work_maybe_restart(port);
 
+	if (skip_perf)
+		goto no_perf;
+
 	rcu_read_lock();
 	rmnet_perf_ingress = rcu_dereference(rmnet_perf_desc_entry);
 	if (rmnet_perf_ingress) {
@@ -1573,6 +1596,7 @@ __rmnet_frag_ingress_handler(struct rmnet_frag_descriptor *frag_desc,
 	}
 	rcu_read_unlock();
 
+no_perf:
 	list_for_each_entry_safe(frag, tmp, &segs, list) {
 		list_del_init(&frag->list);
 		rmnet_frag_deliver(frag, port);
@@ -1592,6 +1616,7 @@ void rmnet_frag_ingress_handler(struct sk_buff *skb,
 {
 	rmnet_perf_chain_hook_t rmnet_perf_opt_chain_end;
 	LIST_HEAD(desc_list);
+	bool skip_perf = (skb->priority == 0xda1a);
 
 	/* Deaggregation and freeing of HW originating
 	 * buffers is done within here
@@ -1599,7 +1624,7 @@ void rmnet_frag_ingress_handler(struct sk_buff *skb,
 	while (skb) {
 		struct sk_buff *skb_frag;
 
-		rmnet_frag_deaggregate(skb, port, &desc_list);
+		rmnet_frag_deaggregate(skb, port, &desc_list, skb->priority);
 		if (!list_empty(&desc_list)) {
 			struct rmnet_frag_descriptor *frag_desc, *tmp;
 
@@ -1615,6 +1640,9 @@ void rmnet_frag_ingress_handler(struct sk_buff *skb,
 		consume_skb(skb);
 		skb = skb_frag;
 	}
+
+	if (skip_perf)
+		return;
 
 	rcu_read_lock();
 	rmnet_perf_opt_chain_end = rcu_dereference(rmnet_perf_chain_end);
