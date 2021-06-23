@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2018-2020, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -18,7 +18,7 @@
 #include <linux/skbuff.h>
 #define CONFIG_QTI_QMI_RMNET 1
 
-void rmnet_map_tx_qmap_cmd(struct sk_buff *qmap_skb);
+void rmnet_map_tx_qmap_cmd(struct sk_buff *qmap_skb, u8 ch, bool flush);
 
 #ifdef CONFIG_QTI_QMI_RMNET
 void *rmnet_get_qmi_pt(void *port);
@@ -35,6 +35,9 @@ void rmnet_get_packets(void *port, u64 *rx, u64 *tx);
 int rmnet_get_powersave_notif(void *port);
 struct net_device *rmnet_get_real_dev(void *port);
 int rmnet_get_dlmarker_info(void *port);
+void rmnet_lock_unlock_all_flows(void *port, bool lock);
+void rmnet_get_disabled_flows(void *port, u8 *num_bearers, u8 *bearer_id);
+void rmnet_reset_enabled_flows(void *port);
 #else
 static inline void *rmnet_get_qmi_pt(void *port)
 {

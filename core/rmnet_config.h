@@ -69,6 +69,31 @@ struct rmnet_egress_agg_params {
 	u32 agg_time;
 };
 
+enum {
+	RMNET_DEFAULT_AGG_STATE,
+	RMNET_LL_AGG_STATE,
+	RMNET_MAX_AGG_STATE,
+};
+
+struct rmnet_aggregation_state {
+	struct rmnet_egress_agg_params params;
+	struct timespec64 agg_time;
+	struct timespec64 agg_last;
+	struct hrtimer hrtimer;
+	struct work_struct agg_wq;
+	/* Protect aggregation related elements */
+	spinlock_t agg_lock;
+	struct sk_buff *agg_skb;
+	int (*send_agg_skb)(struct sk_buff *skb);
+	int agg_state;
+	u8 agg_count;
+	u8 agg_size_order;
+	struct list_head agg_list;
+	struct rmnet_agg_page *agg_head;
+	struct rmnet_agg_stats *stats;
+};
+
+
 struct rmnet_agg_page {
 	struct list_head list;
 	struct page *page;
@@ -87,21 +112,7 @@ struct rmnet_port {
 	struct net_device *bridge_ep;
 	void *rmnet_perf;
 
-	struct rmnet_egress_agg_params egress_agg_params;
-
-	/* Protect aggregation related elements */
-	spinlock_t agg_lock;
-
-	struct sk_buff *agg_skb;
-	int agg_state;
-	u8 agg_count;
-	struct timespec64 agg_time;
-	struct timespec64 agg_last;
-	struct hrtimer hrtimer;
-	struct work_struct agg_wq;
-	u8 agg_size_order;
-	struct list_head agg_list;
-	struct rmnet_agg_page *agg_head;
+	struct rmnet_aggregation_state agg_state[RMNET_MAX_AGG_STATE];
 
 	void *qmi_info;
 
@@ -177,6 +188,8 @@ struct rmnet_priv_stats {
 	u64 ul_prio;
 	u64 tso_pkts;
 	u64 tso_arriv_errs;
+	u64 ll_tso_segs;
+	u64 ll_tso_errs;
 };
 
 struct rmnet_priv {

@@ -26,6 +26,7 @@
 #include "rmnet_map.h"
 #include "rmnet_handlers.h"
 #include "rmnet_descriptor.h"
+#include "rmnet_ll.h"
 
 #include "rmnet_qmi.h"
 #include "qmi_rmnet.h"
@@ -118,6 +119,10 @@ rmnet_deliver_skb(struct sk_buff *skb, struct rmnet_port *port)
 	skb->pkt_type = PACKET_HOST;
 	skb_set_mac_header(skb, 0);
 
+	/* Low latency packets use a different balancing scheme */
+	if (skb->priority == 0xda1a)
+		goto skip_shs;
+
 	rcu_read_lock();
 	rmnet_shs_stamp = rcu_dereference(rmnet_shs_skb_entry);
 	if (rmnet_shs_stamp) {
@@ -127,6 +132,7 @@ rmnet_deliver_skb(struct sk_buff *skb, struct rmnet_port *port)
 	}
 	rcu_read_unlock();
 
+skip_shs:
 	netif_receive_skb(skb);
 }
 EXPORT_SYMBOL(rmnet_deliver_skb);
@@ -291,6 +297,9 @@ rmnet_map_ingress_handler(struct sk_buff *skb,
 		return;
 	}
 
+	if (skb->priority == 0xda1a)
+		goto no_perf;
+
 	/* Pass off handling to rmnet_perf module, if present */
 	rcu_read_lock();
 	rmnet_perf_core_deaggregate = rcu_dereference(rmnet_perf_deag_entry);
@@ -301,6 +310,7 @@ rmnet_map_ingress_handler(struct sk_buff *skb,
 	}
 	rcu_read_unlock();
 
+no_perf:
 	/* Deaggregation and freeing of HW originating
 	 * buffers is done within here
 	 */
@@ -323,10 +333,12 @@ next_skb:
 
 static int rmnet_map_egress_handler(struct sk_buff *skb,
 				    struct rmnet_port *port, u8 mux_id,
-				    struct net_device *orig_dev)
+				    struct net_device *orig_dev,
+				    bool low_latency)
 {
 	int required_headroom, additional_header_len, csum_type, tso = 0;
 	struct rmnet_map_header *map_header;
+	struct rmnet_aggregation_state *state;
 
 	additional_header_len = 0;
 	required_headroom = sizeof(struct rmnet_map_header);
@@ -351,13 +363,16 @@ static int rmnet_map_egress_handler(struct sk_buff *skb,
 	if (port->data_format & RMNET_INGRESS_FORMAT_PS)
 		qmi_rmnet_work_maybe_restart(port);
 
+	state = &port->agg_state[(low_latency) ? RMNET_LL_AGG_STATE :
+				 RMNET_DEFAULT_AGG_STATE];
+
 	if (csum_type &&
 	    (skb_shinfo(skb)->gso_type & (SKB_GSO_UDP_L4 | SKB_GSO_TCPV4 | SKB_GSO_TCPV6)) &&
 	     skb_shinfo(skb)->gso_size) {
 		unsigned long flags;
 
-		spin_lock_irqsave(&port->agg_lock, flags);
-		rmnet_map_send_agg_skb(port, flags);
+		spin_lock_irqsave(&state->agg_lock, flags);
+		rmnet_map_send_agg_skb(state, flags);
 
 		if (rmnet_map_add_tso_header(skb, port, orig_dev))
 			return -EINVAL;
@@ -377,10 +392,11 @@ static int rmnet_map_egress_handler(struct sk_buff *skb,
 	map_header->mux_id = mux_id;
 
 	if (port->data_format & RMNET_EGRESS_FORMAT_AGGREGATION) {
-		if (rmnet_map_tx_agg_skip(skb, required_headroom) || tso)
+		if (state->params.agg_count < 2 ||
+		    rmnet_map_tx_agg_skip(skb, required_headroom) || tso)
 			goto done;
 
-		rmnet_map_tx_aggregate(skb, port);
+		rmnet_map_tx_aggregate(skb, port, low_latency);
 		return -EINPROGRESS;
 	}
 
@@ -433,7 +449,8 @@ rx_handler_result_t rmnet_rx_handler(struct sk_buff **pskb)
 
 		rcu_read_lock();
 		rmnet_core_shs_switch = rcu_dereference(rmnet_shs_switch);
-		if (rmnet_core_shs_switch && !skb->cb[1]) {
+		if (rmnet_core_shs_switch && !skb->cb[1] &&
+		    skb->priority != 0xda1a) {
 			skb->cb[1] = 1;
 			rmnet_core_shs_switch(skb, &port->phy_shs_cfg);
 			rcu_read_unlock();
@@ -457,7 +474,7 @@ EXPORT_SYMBOL(rmnet_rx_handler);
  * for egress device configured in logical endpoint. Packet is then transmitted
  * on the egress device.
  */
-void rmnet_egress_handler(struct sk_buff *skb)
+void rmnet_egress_handler(struct sk_buff *skb, bool low_latency)
 {
 	struct net_device *orig_dev;
 	struct rmnet_port *port;
@@ -480,7 +497,8 @@ void rmnet_egress_handler(struct sk_buff *skb)
 		goto drop;
 
 	skb_len = skb->len;
-	err = rmnet_map_egress_handler(skb, port, mux_id, orig_dev);
+	err = rmnet_map_egress_handler(skb, port, mux_id, orig_dev,
+				       low_latency);
 	if (err == -ENOMEM || err == -EINVAL) {
 		goto drop;
 	} else if (err == -EINPROGRESS) {
@@ -490,7 +508,16 @@ void rmnet_egress_handler(struct sk_buff *skb)
 
 	rmnet_vnd_tx_fixup(orig_dev, skb_len);
 
-	dev_queue_xmit(skb);
+	if (low_latency) {
+		if (rmnet_ll_send_skb(skb)) {
+			/* Drop but no need to free. Above API handles that */
+			this_cpu_inc(priv->pcpu_stats->stats.tx_drops);
+			return;
+		}
+	} else {
+		dev_queue_xmit(skb);
+	}
+
 	return;
 
 drop:

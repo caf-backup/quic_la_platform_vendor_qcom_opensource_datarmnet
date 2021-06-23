@@ -17,6 +17,8 @@
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
 #include <linux/timer.h>
+#include <uapi/linux/rtnetlink.h>
+#include <linux/soc/qcom/qmi.h>
 
 #define MAX_MQ_NUM 16
 #define MAX_CLIENT_NUM 2
@@ -38,6 +40,34 @@ extern int dfc_mode;
 extern int dfc_qmap;
 
 struct qos_info;
+
+enum {
+	RMNET_CH_DEFAULT,
+	RMNET_CH_LL,
+	RMNET_CH_MAX,
+	RMNET_CH_CTL = 0xFF
+};
+
+enum rmnet_ch_switch_state {
+	CH_SWITCH_NONE,
+	CH_SWITCH_STARTED,
+	CH_SWITCH_ACKED,
+	CH_SWITCH_FAILED_RETRY
+};
+
+struct rmnet_ch_switch {
+	u8 current_ch;
+	u8 switch_to_ch;
+	u8 retry_left;
+	u8 status_code;
+	enum rmnet_ch_switch_state state;
+	__be32 switch_txid;
+	u32 flags;
+	bool timer_quit;
+	struct timer_list guard_timer;
+	u32 nl_pid;
+	u32 nl_seq;
+};
 
 struct rmnet_bearer_map {
 	struct list_head list;
@@ -62,6 +92,7 @@ struct rmnet_bearer_map {
 	bool watchdog_started;
 	bool watchdog_quit;
 	u32 watchdog_expire_cnt;
+	struct rmnet_ch_switch ch_switch;
 };
 
 struct rmnet_flow_map {
@@ -81,6 +112,7 @@ struct svc_info {
 
 struct mq_map {
 	struct rmnet_bearer_map *bearer;
+	bool is_ll_ch;
 };
 
 struct qos_info {
@@ -107,6 +139,7 @@ struct qmi_info {
 	bool ps_enabled;
 	bool dl_msg_active;
 	bool ps_ignore_grant;
+	int ps_ext;
 };
 
 enum data_ep_type_enum_v01 {
@@ -169,6 +202,10 @@ void qmi_rmnet_watchdog_add(struct rmnet_bearer_map *bearer);
 
 void qmi_rmnet_watchdog_remove(struct rmnet_bearer_map *bearer);
 
+int rmnet_ll_switch(struct net_device *dev, struct tcmsg *tcm, int attrlen);
+void rmnet_ll_guard_fn(struct timer_list *t);
+void rmnet_ll_wq_init(void);
+void rmnet_ll_wq_exit(void);
 #else
 static inline struct rmnet_flow_map *
 qmi_rmnet_get_flow_map(struct qos_info *qos_info,
@@ -216,6 +253,12 @@ static inline void dfc_qmap_client_exit(void *dfc_data)
 static inline void qmi_rmnet_watchdog_remove(struct rmnet_bearer_map *bearer)
 {
 }
+
+static int rmnet_ll_switch(struct net_device *dev,
+			   struct tcmsg *tcm, int attrlen)
+{
+	return -EINVAL;
+}
 #endif
 
 #ifdef CONFIG_QTI_QMI_POWER_COLLAPSE
@@ -225,6 +268,7 @@ void wda_qmi_client_exit(void *wda_data);
 int wda_set_powersave_mode(void *wda_data, u8 enable);
 void qmi_rmnet_flush_ps_wq(void);
 void wda_qmi_client_release(void *wda_data);
+int dfc_qmap_set_powersave(u8 enable, u8 num_bearers, u8 *bearer_id);
 #else
 static inline int
 wda_qmi_client_init(void *port, struct svc_info *psvc, struct qmi_info *qmi)
