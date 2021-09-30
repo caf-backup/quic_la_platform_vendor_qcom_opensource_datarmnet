@@ -299,6 +299,58 @@ static u16 rmnet_vnd_select_queue(struct net_device *dev,
 	}
 
 skip_trace_print_icmp_tx:
+	if (trace_print_tcp_tx_enabled()) {
+		char saddr[INET6_ADDRSTRLEN], daddr[INET6_ADDRSTRLEN];
+
+		memset(saddr, 0, INET6_ADDRSTRLEN);
+		memset(daddr, 0, INET6_ADDRSTRLEN);
+
+		if (skb->protocol == htons(ETH_P_IP)) {
+			if (ip_hdr(skb)->protocol != IPPROTO_TCP)
+				goto skip_trace_print_tcp_tx;
+
+			snprintf(saddr, INET6_ADDRSTRLEN, "%pI4", &ip_hdr(skb)->saddr);
+			snprintf(daddr, INET6_ADDRSTRLEN, "%pI4", &ip_hdr(skb)->daddr);
+		}
+
+		if (skb->protocol == htons(ETH_P_IPV6)) {
+			if (ipv6_hdr(skb)->nexthdr != IPPROTO_TCP)
+				goto skip_trace_print_tcp_tx;
+
+			snprintf(saddr, INET6_ADDRSTRLEN, "%pI6", &ipv6_hdr(skb)->saddr);
+			snprintf(daddr, INET6_ADDRSTRLEN, "%pI6", &ipv6_hdr(skb)->daddr);
+		}
+
+		trace_print_tcp_tx(skb, saddr, daddr, tcp_hdr(skb));
+	}
+
+skip_trace_print_tcp_tx:
+	if (trace_print_udp_tx_enabled()) {
+		char saddr[INET6_ADDRSTRLEN], daddr[INET6_ADDRSTRLEN];
+
+		memset(saddr, 0, INET6_ADDRSTRLEN);
+		memset(daddr, 0, INET6_ADDRSTRLEN);
+
+		if (skb->protocol == htons(ETH_P_IP)) {
+			if (ip_hdr(skb)->protocol != IPPROTO_UDP)
+				goto skip_trace_print_udp_tx;
+
+			snprintf(saddr, INET6_ADDRSTRLEN, "%pI4", &ip_hdr(skb)->saddr);
+			snprintf(daddr, INET6_ADDRSTRLEN, "%pI4", &ip_hdr(skb)->daddr);
+		}
+
+		if (skb->protocol == htons(ETH_P_IPV6)) {
+			if (ipv6_hdr(skb)->nexthdr != IPPROTO_UDP)
+				goto skip_trace_print_udp_tx;
+
+			snprintf(saddr, INET6_ADDRSTRLEN, "%pI6", &ipv6_hdr(skb)->saddr);
+			snprintf(daddr, INET6_ADDRSTRLEN, "%pI6", &ipv6_hdr(skb)->daddr);
+		}
+
+		trace_print_udp_tx(skb, saddr, daddr, udp_hdr(skb));
+	}
+
+skip_trace_print_udp_tx:
 	if (trace_print_skb_gso_enabled()) {
 		char saddr[INET6_ADDRSTRLEN], daddr[INET6_ADDRSTRLEN];
 		u16 ip_proto = 0, xport_proto = 0;
@@ -433,6 +485,19 @@ static const char rmnet_port_gstrings_stats[][ETH_GSTRING_LEN] = {
 	"DL trailer pkts received",
 	"UL agg reuse",
 	"UL agg alloc",
+	"DL chaining [0-10)",
+	"DL chaining [10-20)",
+	"DL chaining [20-30)",
+	"DL chaining [30-40)",
+	"DL chaining [40-50)",
+	"DL chaining [50-60)",
+	"DL chaining >= 60",
+	"DL chaining frags [0-1]",
+	"DL chaining frags [2-3]",
+	"DL chaining frags [4-7]",
+	"DL chaining frags [8-11]",
+	"DL chaining frags [12-15]",
+	"DL chaining frags = 16",
 };
 
 static const char rmnet_ll_gstrings_stats[][ETH_GSTRING_LEN] = {
