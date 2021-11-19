@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -226,21 +227,6 @@ int qmi_rmnet_flow_control(struct net_device *dev, u32 mq_idx, int enable)
 	return 0;
 }
 
-static void qmi_rmnet_reset_txq(struct net_device *dev, unsigned int txq)
-{
-	struct Qdisc *qdisc;
-
-	if (unlikely(txq >= dev->num_tx_queues))
-		return;
-
-	qdisc = rtnl_dereference(netdev_get_tx_queue(dev, txq)->qdisc);
-	if (qdisc) {
-		spin_lock_bh(qdisc_lock(qdisc));
-		qdisc_reset(qdisc);
-		spin_unlock_bh(qdisc_lock(qdisc));
-	}
-}
-
 /**
  * qmi_rmnet_watchdog_fn - watchdog timer func
  */
@@ -371,15 +357,13 @@ static void __qmi_rmnet_bearer_put(struct net_device *dev,
 
 			mq->bearer = NULL;
 			mq->is_ll_ch = false;
-			if (reset) {
-				qmi_rmnet_reset_txq(dev, i);
-				qmi_rmnet_flow_control(dev, i, 1);
+			mq->drop_on_remove = reset;
+			smp_mb();
 
-				if (dfc_mode == DFC_MODE_SA) {
-					j = i + ACK_MQ_OFFSET;
-					qmi_rmnet_reset_txq(dev, j);
-					qmi_rmnet_flow_control(dev, j, 1);
-				}
+			qmi_rmnet_flow_control(dev, i, 1);
+			if (dfc_mode == DFC_MODE_SA) {
+				j = i + ACK_MQ_OFFSET;
+				qmi_rmnet_flow_control(dev, j, 1);
 			}
 		}
 
@@ -404,6 +388,8 @@ static void __qmi_rmnet_update_mq(struct net_device *dev,
 	if (!mq->bearer) {
 		mq->bearer = bearer;
 		mq->is_ll_ch = bearer->ch_switch.current_ch;
+		mq->drop_on_remove = false;
+		smp_mb();
 
 		if (dfc_mode == DFC_MODE_SA) {
 			bearer->mq_idx = itm->mq_idx;
@@ -958,8 +944,8 @@ void qmi_rmnet_prepare_ps_bearers(struct net_device *dev, u8 *num_bearers,
 EXPORT_SYMBOL(qmi_rmnet_prepare_ps_bearers);
 
 #ifdef CONFIG_QTI_QMI_DFC
-bool qmi_rmnet_flow_is_low_latency(struct net_device *dev,
-				   struct sk_buff *skb)
+bool qmi_rmnet_get_flow_state(struct net_device *dev, struct sk_buff *skb,
+			      bool *drop, bool *is_low_latency)
 {
 	struct qos_info *qos = rmnet_get_qos_pt(dev);
 	int txq = skb->queue_mapping;
@@ -970,9 +956,15 @@ bool qmi_rmnet_flow_is_low_latency(struct net_device *dev,
 	if (unlikely(!qos || txq >= MAX_MQ_NUM))
 		return false;
 
-	return qos->mq[txq].is_ll_ch;
+	/* If the bearer is gone, packets may need to be dropped */
+	*drop = (txq != DEFAULT_MQ_NUM && !READ_ONCE(qos->mq[txq].bearer) &&
+		 READ_ONCE(qos->mq[txq].drop_on_remove));
+
+	*is_low_latency = READ_ONCE(qos->mq[txq].is_ll_ch);
+
+	return true;
 }
-EXPORT_SYMBOL(qmi_rmnet_flow_is_low_latency);
+EXPORT_SYMBOL(qmi_rmnet_get_flow_state);
 
 void qmi_rmnet_burst_fc_check(struct net_device *dev,
 			      int ip_type, u32 mark, unsigned int len)
@@ -1212,7 +1204,8 @@ done:
 }
 EXPORT_SYMBOL(qmi_rmnet_ps_ind_deregister);
 
-int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable)
+int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable, u8 num_bearers,
+				 u8 *bearer_id)
 {
 	int rc = -EINVAL;
 	struct qmi_info *qmi = (struct qmi_info *)rmnet_get_qmi_pt(port);
@@ -1220,7 +1213,8 @@ int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable)
 	if (!qmi || !qmi->wda_client)
 		return rc;
 
-	rc = wda_set_powersave_mode(qmi->wda_client, enable);
+	rc = wda_set_powersave_mode(qmi->wda_client, enable, num_bearers,
+				    bearer_id);
 	if (rc < 0) {
 		pr_err("%s() failed set powersave mode[%u], err=%d\n",
 			__func__, enable, rc);
@@ -1301,7 +1295,8 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 		qmi->ps_ignore_grant = false;
 
 		/* Register to get QMI DFC and DL marker */
-		if (qmi_rmnet_set_powersave_mode(real_work->port, 0) < 0)
+		if (qmi_rmnet_set_powersave_mode(real_work->port, 0,
+						 0, NULL) < 0)
 			goto end;
 
 		qmi->ps_enabled = false;
@@ -1326,7 +1321,8 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 		}
 
 		/* Deregister to suppress QMI DFC and DL marker */
-		if (qmi_rmnet_set_powersave_mode(real_work->port, 1) < 0)
+		if (qmi_rmnet_set_powersave_mode(real_work->port, 1,
+						 0, NULL) < 0)
 			goto end;
 
 		qmi->ps_enabled = true;
@@ -1372,6 +1368,7 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 	u64 rxd, txd;
 	u64 rx, tx;
 	u8 num_bearers;
+	int rc;
 
 	real_work = container_of(to_delayed_work(work),
 				 struct rmnet_powersave_work, work);
@@ -1398,7 +1395,12 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 		qmi->ps_ignore_grant = false;
 
 		/* Out of powersave */
-		if (dfc_qmap_set_powersave(0, 0, NULL))
+		if (dfc_qmap)
+			rc = dfc_qmap_set_powersave(0, 0, NULL);
+		else
+			rc = qmi_rmnet_set_powersave_mode(real_work->port, 0,
+							  0, NULL);
+		if (rc)
 			goto end;
 
 		qmi->ps_enabled = false;
@@ -1422,7 +1424,11 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 					 ps_bearer_id);
 
 		/* Enter powersave */
-		dfc_qmap_set_powersave(1, num_bearers, ps_bearer_id);
+		if (dfc_qmap)
+			dfc_qmap_set_powersave(1, num_bearers, ps_bearer_id);
+		else
+			qmi_rmnet_set_powersave_mode(real_work->port, 1,
+						     num_bearers, ps_bearer_id);
 
 		if (rmnet_get_powersave_notif(real_work->port))
 			qmi_rmnet_ps_on_notify(real_work->port);
@@ -1471,7 +1477,7 @@ void qmi_rmnet_work_init(void *port)
 		return;
 	}
 
-	if (dfc_qmap && dfc_ps_ext)
+	if (dfc_ps_ext)
 		INIT_DEFERRABLE_WORK(&rmnet_work->work,
 				     qmi_rmnet_check_stats_2);
 	else
