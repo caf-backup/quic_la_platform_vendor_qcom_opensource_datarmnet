@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2018-2021, The Linux Foundation. All rights reserved.
+ * Copyright (c) 2021 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 and
@@ -24,7 +25,6 @@
 #include <linux/moduleparam.h>
 #include <linux/ip.h>
 #include <linux/ipv6.h>
-#include <linux/alarmtimer.h>
 
 #define NLMSG_FLOW_ACTIVATE 1
 #define NLMSG_FLOW_DEACTIVATE 2
@@ -622,7 +622,6 @@ qmi_rmnet_setup_client(void *port, struct qmi_info *qmi, struct tcmsg *tcm)
 		if (!qmi)
 			return -ENOMEM;
 
-		qmi->ws = wakeup_source_register(NULL, "RMNET_DFC");
 		rmnet_init_qmi_pt(port, qmi);
 	}
 
@@ -672,7 +671,6 @@ __qmi_rmnet_delete_client(void *port, struct qmi_info *qmi, int idx)
 
 	if (!qmi_rmnet_has_client(qmi) && !qmi_rmnet_has_pending(qmi)) {
 		rmnet_reset_qmi_pt(port);
-		wakeup_source_unregister(qmi->ws);
 		kfree(qmi);
 		return 0;
 	}
@@ -745,7 +743,6 @@ int qmi_rmnet_change_link(struct net_device *dev, void *port, void *tcm_pt,
 			    !qmi_rmnet_has_client(qmi) &&
 			    !qmi_rmnet_has_pending(qmi)) {
 				rmnet_reset_qmi_pt(port);
-				wakeup_source_unregister(qmi->ws);
 				kfree(qmi);
 			}
 
@@ -1146,7 +1143,6 @@ static u8 ps_bearer_id[32];
 
 struct rmnet_powersave_work {
 	struct delayed_work work;
-	struct alarm atimer;
 	void *port;
 	u64 old_rx_pkts;
 	u64 old_tx_pkts;
@@ -1203,7 +1199,8 @@ done:
 }
 EXPORT_SYMBOL(qmi_rmnet_ps_ind_deregister);
 
-int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable)
+int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable, u8 num_bearers,
+				 u8 *bearer_id)
 {
 	int rc = -EINVAL;
 	struct qmi_info *qmi = (struct qmi_info *)rmnet_get_qmi_pt(port);
@@ -1211,7 +1208,8 @@ int qmi_rmnet_set_powersave_mode(void *port, uint8_t enable)
 	if (!qmi || !qmi->wda_client)
 		return rc;
 
-	rc = wda_set_powersave_mode(qmi->wda_client, enable);
+	rc = wda_set_powersave_mode(qmi->wda_client, enable, num_bearers,
+				    bearer_id);
 	if (rc < 0) {
 		pr_err("%s() failed set powersave mode[%u], err=%d\n",
 			__func__, enable, rc);
@@ -1230,32 +1228,6 @@ static void qmi_rmnet_work_restart(void *port)
 	rcu_read_unlock();
 }
 
-static enum alarmtimer_restart qmi_rmnet_work_alarm(struct alarm *atimer,
-						    ktime_t now)
-{
-	struct rmnet_powersave_work *real_work;
-
-	real_work = container_of(atimer, struct rmnet_powersave_work, atimer);
-	qmi_rmnet_work_restart(real_work->port);
-	return ALARMTIMER_NORESTART;
-}
-
-static void dfc_wakelock_acquire(struct qmi_info *qmi)
-{
-	if (qmi && !qmi->wakelock_active) {
-		__pm_stay_awake(qmi->ws);
-		qmi->wakelock_active = true;
-	}
-}
-
-static void dfc_wakelock_release(struct qmi_info *qmi)
-{
-	if (qmi && qmi->wakelock_active) {
-		__pm_relax(qmi->ws);
-		qmi->wakelock_active = false;
-	}
-}
-
 static void qmi_rmnet_check_stats(struct work_struct *work)
 {
 	struct rmnet_powersave_work *real_work;
@@ -1263,7 +1235,6 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 	u64 rxd, txd;
 	u64 rx, tx;
 	bool dl_msg_active;
-	bool use_alarm_timer = true;
 
 	real_work = container_of(to_delayed_work(work),
 				 struct rmnet_powersave_work, work);
@@ -1274,8 +1245,6 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 	qmi = (struct qmi_info *)rmnet_get_qmi_pt(real_work->port);
 	if (unlikely(!qmi))
 		return;
-
-	dfc_wakelock_release(qmi);
 
 	rmnet_get_packets(real_work->port, &rx, &tx);
 	rxd = rx - real_work->old_rx_pkts;
@@ -1292,7 +1261,8 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 		qmi->ps_ignore_grant = false;
 
 		/* Register to get QMI DFC and DL marker */
-		if (qmi_rmnet_set_powersave_mode(real_work->port, 0) < 0)
+		if (qmi_rmnet_set_powersave_mode(real_work->port, 0,
+						 0, NULL) < 0)
 			goto end;
 
 		qmi->ps_enabled = false;
@@ -1311,13 +1281,12 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 		 * (likely in RLF), no need to enter powersave
 		 */
 		if (!dl_msg_active &&
-		    !rmnet_all_flows_enabled(real_work->port)) {
-			use_alarm_timer = false;
+		    !rmnet_all_flows_enabled(real_work->port))
 			goto end;
-		}
 
 		/* Deregister to suppress QMI DFC and DL marker */
-		if (qmi_rmnet_set_powersave_mode(real_work->port, 1) < 0)
+		if (qmi_rmnet_set_powersave_mode(real_work->port, 1,
+						 0, NULL) < 0)
 			goto end;
 
 		qmi->ps_enabled = true;
@@ -1338,21 +1307,9 @@ static void qmi_rmnet_check_stats(struct work_struct *work)
 	}
 end:
 	rcu_read_lock();
-	if (!rmnet_work_quit) {
-		if (use_alarm_timer) {
-			/* Suspend will fail and get delayed for 2s if
-			 * alarmtimer expires within 2s. Hold a wakelock
-			 * for the actual timer duration to prevent suspend
-			 */
-			if (PS_INTERVAL_MS < 2000)
-				dfc_wakelock_acquire(qmi);
-			alarm_start_relative(&real_work->atimer,
-					     PS_INTERVAL_KT);
-		} else {
-			queue_delayed_work(rmnet_ps_wq, &real_work->work,
-					   PS_INTERVAL_JF);
-		}
-	}
+	if (!rmnet_work_quit)
+		queue_delayed_work(rmnet_ps_wq, &real_work->work,
+				   PS_INTERVAL_JF);
 	rcu_read_unlock();
 }
 
@@ -1363,6 +1320,7 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 	u64 rxd, txd;
 	u64 rx, tx;
 	u8 num_bearers;
+	int rc;
 
 	real_work = container_of(to_delayed_work(work),
 				 struct rmnet_powersave_work, work);
@@ -1373,9 +1331,6 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 	qmi = (struct qmi_info *)rmnet_get_qmi_pt(real_work->port);
 	if (unlikely(!qmi))
 		return;
-
-	if (PS_INTERVAL_MS < 2000)
-		dfc_wakelock_acquire(qmi);
 
 	rmnet_get_packets(real_work->port, &rx, &tx);
 	rxd = rx - real_work->old_rx_pkts;
@@ -1389,7 +1344,12 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 		qmi->ps_ignore_grant = false;
 
 		/* Out of powersave */
-		if (dfc_qmap_set_powersave(0, 0, NULL))
+		if (dfc_qmap)
+			rc = dfc_qmap_set_powersave(0, 0, NULL);
+		else
+			rc = qmi_rmnet_set_powersave_mode(real_work->port, 0,
+							  0, NULL);
+		if (rc)
 			goto end;
 
 		qmi->ps_enabled = false;
@@ -1413,20 +1373,22 @@ static void qmi_rmnet_check_stats_2(struct work_struct *work)
 					 ps_bearer_id);
 
 		/* Enter powersave */
-		dfc_qmap_set_powersave(1, num_bearers, ps_bearer_id);
+		if (dfc_qmap)
+			dfc_qmap_set_powersave(1, num_bearers, ps_bearer_id);
+		else
+			qmi_rmnet_set_powersave_mode(real_work->port, 1,
+						     num_bearers, ps_bearer_id);
 
 		if (rmnet_get_powersave_notif(real_work->port))
 			qmi_rmnet_ps_on_notify(real_work->port);
 
-		dfc_wakelock_release(qmi);
 		return;
 	}
 end:
 	rcu_read_lock();
 	if (!rmnet_work_quit)
-		alarm_start_relative(&real_work->atimer, PS_INTERVAL_KT);
-	else
-		dfc_wakelock_release(qmi);
+		queue_delayed_work(rmnet_ps_wq, &real_work->work,
+				   PS_INTERVAL_JF);
 	rcu_read_unlock();
 }
 
@@ -1462,13 +1424,12 @@ void qmi_rmnet_work_init(void *port)
 		return;
 	}
 
-	if (dfc_qmap && dfc_ps_ext)
-		INIT_DEFERRABLE_WORK(&rmnet_work->work,
+	if (dfc_ps_ext)
+		INIT_DELAYED_WORK(&rmnet_work->work,
 				     qmi_rmnet_check_stats_2);
 	else
-		INIT_DEFERRABLE_WORK(&rmnet_work->work, qmi_rmnet_check_stats);
+		INIT_DELAYED_WORK(&rmnet_work->work, qmi_rmnet_check_stats);
 
-	alarm_init(&rmnet_work->atimer, ALARM_BOOTTIME, qmi_rmnet_work_alarm);
 	rmnet_work->port = port;
 	rmnet_get_packets(rmnet_work->port, &rmnet_work->old_rx_pkts,
 			  &rmnet_work->old_tx_pkts);
@@ -1503,14 +1464,12 @@ void qmi_rmnet_work_exit(void *port)
 	synchronize_rcu();
 
 	rmnet_work_inited = false;
-	alarm_cancel(&rmnet_work->atimer);
 	cancel_delayed_work_sync(&rmnet_work->work);
 	destroy_workqueue(rmnet_ps_wq);
 	qmi_rmnet_work_set_active(port, 0);
 	rmnet_ps_wq = NULL;
 	kfree(rmnet_work);
 	rmnet_work = NULL;
-	dfc_wakelock_release((struct qmi_info *)rmnet_get_qmi_pt(port));
 }
 EXPORT_SYMBOL(qmi_rmnet_work_exit);
 
